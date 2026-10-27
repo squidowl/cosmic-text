@@ -5,8 +5,8 @@
 use crate::fallback::FontFallbackIter;
 use crate::{
     math, Align, Attrs, AttrsList, CacheKeyFlags, Color, DecorationMetrics, DecorationSpan,
-    Ellipsize, EllipsizeHeightLimit, Family, Font, FontSystem, GlyphDecorationData, Hinting,
-    LayoutGlyph, LayoutLine, Metrics, SpanPadding, Wrap,
+    Ellipsize, EllipsizeHeightLimit, Family, Font, FontSystem, GlyphDecorationData, HashSet,
+    Hinting, LayoutGlyph, LayoutLine, Metrics, SpanPadding, Wrap,
 };
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
@@ -20,6 +20,7 @@ use core::ops::Range;
 #[cfg(not(feature = "std"))]
 use core_maths::CoreFloat;
 use fontdb::Style;
+use unicode_properties::{EmojiStatus, UnicodeEmoji};
 use unicode_script::{Script, UnicodeScript};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -149,7 +150,7 @@ fn shape_fallback(
     start_run: usize,
     end_run: usize,
     span_rtl: bool,
-) -> Vec<usize> {
+) -> HashSet<usize> {
     let run = &line[start_run..end_run];
 
     let font_scale = font.metrics().units_per_em as f32;
@@ -180,7 +181,7 @@ fn shape_fallback(
     let mut rb_font_features = Vec::new();
 
     // Convert attrs::Feature to harfrust::Feature
-    for feature in &attrs.font_features.features {
+    for feature in attrs.font_features.iter() {
         rb_font_features.push(harfrust::Feature::new(
             harfrust::Tag::new(feature.tag.as_bytes()),
             feature.value,
@@ -226,14 +227,14 @@ fn shape_fallback(
     let glyph_infos = glyph_buffer.glyph_infos();
     let glyph_positions = glyph_buffer.glyph_positions();
 
-    let mut missing = Vec::new();
+    let mut missing = HashSet::default();
     glyphs.reserve(glyph_infos.len());
     let glyph_start = glyphs.len();
     for (info, pos) in glyph_infos.iter().zip(glyph_positions.iter()) {
         let start_glyph = start_run + info.cluster as usize;
 
         if info.glyph_id == 0 {
-            missing.push(start_glyph);
+            missing.insert(start_glyph);
         }
 
         let attrs = attrs_list.get_span(start_glyph);
@@ -353,8 +354,31 @@ fn shape_run(
         )
     };
 
+    // Clusters in this run that want an emoji (color) presentation. A cluster
+    // may already be "covered" by a non-color font that ships a monochrome
+    // outline glyph for the codepoint (e.g. Noto Sans Symbols); such clusters
+    // are not in `missing` and would otherwise be left monochrome. We track
+    // them as upgrade candidates and swap them to a color font when one is
+    // reached in the fallback chain.
+    let emoji_clusters = emoji_upgrade_clusters(line, start_run, end_run);
+    let mut emoji_upgrade = if font.has_color() {
+        Vec::new()
+    } else {
+        emoji_clusters
+            .iter()
+            .filter(|&&c| !missing.contains(&c))
+            .copied()
+            .collect()
+    };
+
     //TODO: improve performance!
-    while !missing.is_empty() {
+    loop {
+        // Continue while there are missing clusters, or emoji clusters that
+        // could still be upgraded to a color font.
+        if missing.is_empty() && (emoji_upgrade.is_empty() || font_iter.in_other_phase()) {
+            break;
+        }
+
         let Some(font) = font_iter.next() else {
             break;
         };
@@ -376,57 +400,46 @@ fn shape_run(
             span_rtl,
         );
 
-        // Insert all matching glyphs
-        let mut fb_i = 0;
-        while fb_i < fb_glyphs.len() {
-            let start = fb_glyphs[fb_i].start;
-            let end = fb_glyphs[fb_i].end;
+        // Keep clusters that were missing or can be upgraded to color, and not missing in the fallback font
+        let is_color_font = font.has_color();
+        fb_glyphs.retain(|glyph| {
+            !fb_missing.contains(&glyph.start)
+                && (missing.contains(&glyph.start)
+                    || (is_color_font && emoji_upgrade.contains(&glyph.start)))
+        });
 
-            // Skip clusters that are not missing, or where the fallback font is missing
-            if !missing.contains(&start) || fb_missing.contains(&start) {
-                fb_i += 1;
-                continue;
+        // Update missing
+        let mut added = HashSet::default();
+        for fb_glyph in &fb_glyphs {
+            let start = fb_glyph.start;
+            let end = fb_glyph.end;
+
+            if !is_color_font && emoji_clusters.contains(&start) {
+                emoji_upgrade.push(start);
+            }
+            if is_color_font {
+                emoji_upgrade.retain(|&offset| offset < start || offset >= end);
             }
 
-            let mut missing_i = 0;
-            while missing_i < missing.len() {
-                if missing[missing_i] >= start && missing[missing_i] < end {
-                    // println!("No longer missing {}", missing[missing_i]);
-                    missing.remove(missing_i);
-                } else {
-                    missing_i += 1;
-                }
+            for i in start..end {
+                missing.remove(&i);
+                added.insert(i);
             }
+        }
 
-            // Find prior glyphs
-            let mut i = glyph_start;
-            while i < glyphs.len() {
-                if glyphs[i].start >= start && glyphs[i].end <= end {
-                    break;
-                }
-                i += 1;
-            }
+        if added.is_empty() {
+            continue;
+        }
 
-            // Remove prior glyphs
-            while i < glyphs.len() {
-                if glyphs[i].start >= start && glyphs[i].end <= end {
-                    let _glyph = glyphs.remove(i);
-                    // log::trace!("Removed {},{} from {}", _glyph.start, _glyph.end, i);
-                } else {
-                    break;
-                }
-            }
+        // Remove prior glyphs
+        glyphs.retain(|glyph| !added.contains(&glyph.start));
 
-            while fb_i < fb_glyphs.len() {
-                if fb_glyphs[fb_i].start >= start && fb_glyphs[fb_i].end <= end {
-                    let fb_glyph = fb_glyphs.remove(fb_i);
-                    // log::trace!("Insert {},{} from font {} at {}", fb_glyph.start, fb_glyph.end, font_i, i);
-                    glyphs.insert(i, fb_glyph);
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
+        // Sort the new glyphs in to maintain monotonicity.
+        glyphs.extend(fb_glyphs);
+        if span_rtl {
+            (&mut glyphs[glyph_start..]).sort_by(|a, b| b.start.cmp(&a.start));
+        } else {
+            (&mut glyphs[glyph_start..]).sort_by(|a, b| a.start.cmp(&b.start));
         }
     }
 
@@ -649,6 +662,103 @@ fn shape_skip_glyphs(
                 }
             }),
     );
+}
+
+/// Returns `true` if `c` should be rendered using an emoji (color) font when
+/// one is available.
+///
+/// This covers the Unicode `Emoji_Presentation` property (characters that
+/// default to emoji presentation, e.g. ☕ and 😀) as well as emoji characters
+/// explicitly forced to emoji presentation by a following `U+FE0F` variation
+/// selector (VS16).
+#[inline]
+fn wants_emoji_presentation(c: char, next: Option<char>) -> bool {
+    use EmojiStatus as E;
+    // Characters that have `Emoji_Presentation=YES` according to TR51. The
+    // `unicode-properties` crate folds this into the `EmojiStatus` variants
+    // whose name contains "Presentation".
+    let presentation_default = matches!(
+        c.emoji_status(),
+        E::EmojiPresentation
+            | E::EmojiPresentationAndModifierBase
+            | E::EmojiPresentationAndEmojiComponent
+            | E::EmojiPresentationAndModifierAndEmojiComponent
+    );
+    // U+FE0F explicitly requests emoji presentation for the preceding emoji
+    // character.
+    let forced_by_vs16 = next == Some('\u{FE0F}')
+        && matches!(
+            c.emoji_status(),
+            E::EmojiPresentation
+                | E::EmojiPresentationAndModifierBase
+                | E::EmojiPresentationAndEmojiComponent
+                | E::EmojiPresentationAndModifierAndEmojiComponent
+                | E::EmojiModifierBase
+                | E::EmojiOther
+                | E::EmojiOtherAndEmojiComponent
+        );
+    presentation_default || forced_by_vs16
+}
+
+/// Returns the byte offsets (relative to `line`) of clusters in the run
+/// `line[start_run..end_run]` that should be upgraded to a color emoji font
+/// when one is available.
+///
+/// The returned offsets are the `start` byte index of each emoji cluster and
+/// align with [`ShapeGlyph::start`], so they can be matched directly against
+/// shaped glyphs. Each cluster is the text between emoji "boundaries": an
+/// emoji character together with any following emoji modifiers, variation
+/// selectors and zero-width joiners.
+fn emoji_upgrade_clusters(line: &str, start_run: usize, end_run: usize) -> Vec<usize> {
+    let mut clusters = Vec::new();
+
+    let mut i = start_run;
+    while i < end_run {
+        // Safely decode one char and peek the following char.
+        let c = match line[i..].chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        let next = line[i + c.len_utf8()..end_run].chars().next();
+
+        if wants_emoji_presentation(c, next) {
+            // Start of an emoji cluster. Consume the cluster: the base char
+            // plus any trailing emoji modifiers, variation selectors, regional
+            // indicators, tag characters and ZWJ-joined chars. These all share
+            // this cluster's offset and don't produce their own.
+            let mut j = i + c.len_utf8();
+            while j < end_run {
+                let nc = match line[j..end_run].chars().next() {
+                    Some(nc) => nc,
+                    None => break,
+                };
+                let is_trailer = matches!(nc,
+                    '\u{FE0E}' | '\u{FE0F}'                  // variation selectors
+                    | '\u{200D}'                             // ZWJ
+                    | '\u{1F1E6}'..='\u{1F1FF}'              // regional indicators (flags)
+                    | '\u{E0020}'..='\u{E007F}'              // tag chars (subdivision flags)
+                    | '\u{1F3FB}'..='\u{1F3FF}'             // skin-tone modifiers
+                );
+                if is_trailer {
+                    j += nc.len_utf8();
+                    // If this trailer is a ZWJ, also consume the joined char
+                    // that follows it so it stays in the same cluster.
+                    if nc == '\u{200D}' {
+                        if let Some(joined) = line[j..end_run].chars().next() {
+                            j += joined.len_utf8();
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+            clusters.push(i);
+            i = j;
+            continue;
+        }
+        i += c.len_utf8();
+    }
+    clusters
 }
 
 fn override_fake_italic(
@@ -3049,11 +3159,7 @@ impl ShapeLine {
                                         font_size,
                                         Some(SpanWordGlyphPos::with_wordglyph(
                                             span_index,
-                                            if i > 0 && span.words[i - 1].blank {
-                                                WordGlyphPos::new(i - 1, 0)
-                                            } else {
-                                                WordGlyphPos::new(i, 0)
-                                            },
+                                            WordGlyphPos::new(i, 0),
                                         )),
                                         width_opt,
                                         ellipsize,
@@ -3257,14 +3363,12 @@ impl ShapeLine {
                                 _ => font_size,
                             };
 
-                            let mut x_advance = glyph_font_size.mul_add(
-                                glyph.x_advance,
-                                if word.blank {
+                            let mut x_advance = glyph_font_size * glyph.x_advance
+                                + if word.blank {
                                     justification_expansion
                                 } else {
                                     0.0
-                                },
-                            );
+                                };
                             if let Some(match_em_width) = match_mono_em_width {
                                 // Round to nearest monospace width
                                 x_advance = ((x_advance / match_em_width).round()) * match_em_width;
@@ -3322,7 +3426,7 @@ impl ShapeLine {
                             let glyph_idx = glyphs.len() - 1;
                             let extends = matches!(
                                 (decorations.last(), &glyph_deco),
-                                (Some(span), Some((_, d))) if span.data == *d
+                                (Some(span), Some((_, d))) if span.data == *d && span.glyph_range.end == glyph_idx
                             );
                             if extends {
                                 if let Some(last) = decorations.last_mut() {
